@@ -119,8 +119,12 @@ class MisReportInstancePeriod(models.Model):
                      ('date_end', '>=', d),
                      '|',
                      ('company_id', '=', False),
-                     ('company_id', '=', report.company_id.id)])
+                     ('company_id', 'in',
+                      record.report_instance_id.company_ids.ids)])
                 if current_periods:
+                    # TODO we take the first date range we found as current
+                    #      this may be surprising if several companies
+                    #      have overlapping date ranges with different dates
                     current_period = current_periods[0]
                     all_periods = date_range_obj.search(
                         [('type_id', '=', current_period.type_id.id),
@@ -334,9 +338,10 @@ class MisReportInstance(models.Model):
                 record.pivot_date = fields.Date.context_today(record)
 
     @api.model
-    def _default_company(self):
-        return self.env['res.company'].\
-            _company_default_get('mis.report.instance')
+    def _default_company_id(self):
+        default_company_id = self.env['res.company'].\
+            _company_default_get('mis.report.instance').id
+        return default_company_id
 
     _name = 'mis.report.instance'
 
@@ -362,10 +367,31 @@ class MisReportInstance(models.Model):
                                    string='Target Moves',
                                    required=True,
                                    default='posted')
-    company_id = fields.Many2one(comodel_name='res.company',
-                                 string='Company',
-                                 default=_default_company,
-                                 required=True)
+    company_id = fields.Many2one(
+        comodel_name='res.company',
+        string='Company',
+        default=_default_company_id,
+        required=True,
+    )
+    multi_company = fields.Boolean(
+        string='Multiple',
+        help="Check if you wish to specify "
+             "children companies to be searched for data.",
+        default=False,
+    )
+    company_ids = fields.Many2many(
+        comodel_name='res.company',
+        string='Companies',
+        help="Select companies for which data will be searched.",
+        required=True,
+    )
+    currency_id = fields.Many2one(
+        comodel_name='res.currency',
+        string='Currency',
+        help="Select target currency for the report. "
+             "Required if companies have different currencies.",
+        required=False,
+    )
     landscape_pdf = fields.Boolean(string='Landscape PDF')
     comparison_mode = fields.Boolean(
         compute="_compute_comparison_mode",
@@ -376,6 +402,15 @@ class MisReportInstance(models.Model):
     date_from = fields.Date(string="From")
     date_to = fields.Date(string="To")
     temporary = fields.Boolean(default=False)
+
+    @api.onchange('company_id', 'multi_company')
+    def _onchange_company(self):
+        if self.company_id and self.multi_company:
+            self.company_ids = self.env['res.company'].search([
+                ('id', 'child_of', self.company_id.id),
+            ])
+        else:
+            self.company_ids = self.company_id
 
     @api.multi
     def save_report(self):
@@ -584,7 +619,8 @@ class MisReportInstance(models.Model):
         is guaranteed to be the id of the mis.report.instance.period.
         """
         self.ensure_one()
-        aep = self.report_id._prepare_aep(self.company_id)
+        aep = self.report_id._prepare_aep(
+            self.company_ids or self.company_id, self.currency_id)
         kpi_matrix = self.report_id.prepare_kpi_matrix()
         for period in self.period_ids:
             description = None
@@ -615,7 +651,7 @@ class MisReportInstance(models.Model):
         account_id = arg.get('account_id')
         if period_id and expr and AEP.has_account_var(expr):
             period = self.env['mis.report.instance.period'].browse(period_id)
-            aep = AEP(self.company_id)
+            aep = AEP(self.company_ids or self.company_id, self.currency_id)
             aep.parse_expr(expr)
             aep.done_parsing()
             domain = aep.get_aml_domain_for_expr(
